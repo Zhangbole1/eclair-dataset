@@ -1,0 +1,5 @@
+docker build -t eclair-image .
+
+docker run --rm -it   --gpus all   -v "/f/bysj/eclair-dataset/data:/data"   -v "/f/bysj/eclair-dataset/model:/model_weights"   --workdir /app   eclair-image   bash
+
+python test.py --dataset_path /data --model_weights_file /model_weights/model_eclair.pth

@@ -10,7 +10,7 @@ dependencies:
   - laspy
   - lazrs-python
   - mkl=2024.0
-  - numpy
+  - numpy<2
   - omegaconf
   - pyg
   - python=3.10
@@ -26,3 +26,4 @@ dependencies:
   - pip:
       - --prefer-binary --find-links=/wheels
       - MinkowskiEngine # installs a non-cuda PyPI version if used outside the docker
+      - pillow
