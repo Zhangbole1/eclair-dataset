@@ -1,5 +1,23 @@
+cd F:/bysj/eclair-dataset
+F:
 docker build -t eclair-image .
 
-docker run --rm -it   --gpus all   -v "/f/bysj/eclair-dataset/data:/data"   -v "/f/bysj/eclair-dataset/model:/model_weights"   --workdir /app   eclair-image   bash
+docker run --rm -it   --gpus all   -v "/f/bysj/eclair-dataset/data:/data"   -v "/f/bysj/eclair-dataset/model:/model_weights"   --workdir /app   eclair-image2   bash
+
+docker run -d --name eclair-test --gpus all   -v "/f/bysj/eclair-dataset/data:/data"   -v "/f/bysj/eclair-dataset/model:/model_weights"   --workdir /app   eclair-image2   tail -f /dev/null
+
 
 python test.py --dataset_path /data --model_weights_file /model_weights/model_eclair.pth
+
+python train.py --dataset_path /data --model_output_dir ./checkpoints
+
+python train.py --dataset_path /data --model_output_dir ./checkpoints --max_epochs 1
+
+
+以上为docker架构，只能cpu运行
+以下为windows架构
+
+python train.py --config configs/train.yaml
+
+python infer.py
+
