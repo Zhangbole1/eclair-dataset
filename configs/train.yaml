@@ -3,7 +3,7 @@
 # 随机种子
 random_seed: 1984
 
-# 体素化大小（与模型前向保持一致）
+# 体素化大小（与模型前向一致）
 voxel_size: 0.05
 
 # 类别数
@@ -20,18 +20,25 @@ num_features: 14
 # 忽略索引（与 CrossEntropyLoss 一致）
 ignore_index: -100
 
-# 训练/验证时的 transforms
+# 分训练/验证的 transforms
 train_transforms:
   - name: NormalizeCoordinates
   - name: NormalizeFeatures
     params:
       feature_names: ${feature_names}
+  - name: RemapClassification
+    params:
+      class_mapping: ${input_mapping}
+
 
 val_transforms:
   - name: NormalizeCoordinates
   - name: NormalizeFeatures
     params:
       feature_names: ${feature_names}
+  - name: RemapClassification
+    params:
+      class_mapping: ${input_mapping}
 
 # Batch sizes
 train_batch_size: 4
@@ -46,7 +53,7 @@ gamma: 0.1
 # 训练轮数
 max_epochs: 100
 
-# 输入映射（可选）
+# （可选）类别映射，如果你在推理时不需要就删掉
 input_mapping:
   0: 0
   1: 1
@@ -61,7 +68,6 @@ input_mapping:
   10: 10
   11: 11
 
-# 输出映射
 output_mapping:
   0: 0
   1: 1
@@ -76,7 +82,7 @@ output_mapping:
   10: 10
   11: 11
 
-# 分类名称（可选）
+# 如果有分类名称，也可以加上
 class_names:
   0: Undefined
   1: Unassigned

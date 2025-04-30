@@ -1,160 +1,318 @@
-from torch_geometric.nn import fps, knn
+# Credits: the code is adapted from https://github.com/NVIDIA/MinkowskiEngine/blob/02fc608bea4c0549b0a7b00ca1bf15dee4a0b228/examples/minkunet.py#L1
 
-import torch
+
+import MinkowskiEngine as ME
 import torch.nn as nn
 
 
+class BasicBlock(nn.Module):
+    expansion = 1
 
-def safe_fps(x, ratio):
-    """
-    Farthest Point Sampling，但至少采一个点。
-    x: Tensor [M,3]
-    ratio: float  采样比例
-    """
-    M = x.size(0)
-    # 目标采样数至少 1
-    num = max(int(M * ratio), 1)
-    # 调用导入的 fps，而不是 safe_fps
-    idx = fps(x, batch=None, ratio=ratio)
-    # 如果 fps 返回的点少于目标数，就随机补足
-    if idx.numel() < num:
-        # 随机打乱再取前 num
-        idx = torch.randperm(M, device=x.device)[:num]
-    return idx
+    def __init__(self, inplanes, planes, stride=1, dilation=1, downsample=None, bn_momentum=0.1, dimension=-1):
+        super(BasicBlock, self).__init__()
+        assert dimension > 0
 
+        self.conv1 = ME.MinkowskiConvolution(
+            inplanes, planes, kernel_size=3, stride=stride, dilation=dilation, dimension=dimension
+        )
+        self.norm1 = ME.MinkowskiBatchNorm(planes, momentum=bn_momentum)
+        self.conv2 = ME.MinkowskiConvolution(
+            planes, planes, kernel_size=3, stride=1, dilation=dilation, dimension=dimension
+        )
+        self.norm2 = ME.MinkowskiBatchNorm(planes, momentum=bn_momentum)
+        self.relu = ME.MinkowskiReLU(inplace=True)
+        self.downsample = downsample
 
-def safe_knn(x, y, k):
-    """
-    k-NN 查询，但 k 不超过 x 点数，且至少 1。
-    x: Tensor [M,3] 被查询点集
-    y: Tensor [N,3] 查询中心点集
-    k: 原始请求的邻居数
-    """
-    M = x.size(0)
-    k_eff = min(max(k, 1), M)
-    return knn(x=x, y=y, k=k_eff)
+    def forward(self, x):
+        residual = x
 
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
 
-def MLP(channels, batch_norm=True):
-    """Creates a sequential MLP network given a list of channel sizes."""
-    layers = []
-    for i in range(len(channels) - 1):
-        layers.append(nn.Linear(channels[i], channels[i + 1], bias=not batch_norm))
-        if batch_norm:
-            layers.append(nn.BatchNorm1d(channels[i + 1]))
-        layers.append(nn.ReLU(inplace=True))
-    return nn.Sequential(*layers)
+        out = self.conv2(out)
+        out = self.norm2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
 
 
-class PointNetPP(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        # Set Abstraction layers
-        # SA1: from N -> N1 points, input feature 14 -> 64 -> 128 dims
-        self.sa1_mlp = MLP([14 + 3, 64, 128])  # +3 for relative coords
-        # SA2: from N1 -> N2 points, input feature 128 -> 128 -> 256 dims
-        self.sa2_mlp = MLP([128 + 3, 128, 256])
-        # (You can add more SA layers for larger networks)
-        # Feature Propagation layers
-        # FP1: propagate from SA2 (N2 points, 256-dim) to SA1 (N1 points, 128-dim)
-        self.fp1_mlp = MLP([256 + 128, 128, 128])  # concat SA2 feat (interp) with SA1 feat
-        # FP2: propagate from SA1 (N1, 128-dim) to original N points (14-dim input skip)
-        self.fp2_mlp = MLP([128 + 14, 128, 128])  # concat SA1 interp with original features
-        # Segmentation head
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64), nn.ReLU(inplace=True), nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, dilation=1, downsample=None, bn_momentum=0.1, dimension=-1):
+        super(Bottleneck, self).__init__()
+        assert dimension > 0
+
+        self.conv1 = ME.MinkowskiConvolution(inplanes, planes, kernel_size=1, dimension=dimension)
+        self.norm1 = ME.MinkowskiBatchNorm(planes, momentum=bn_momentum)
+
+        self.conv2 = ME.MinkowskiConvolution(
+            planes, planes, kernel_size=3, stride=stride, dilation=dilation, dimension=dimension
+        )
+        self.norm2 = ME.MinkowskiBatchNorm(planes, momentum=bn_momentum)
+
+        self.conv3 = ME.MinkowskiConvolution(planes, planes * self.expansion, kernel_size=1, dimension=dimension)
+        self.norm3 = ME.MinkowskiBatchNorm(planes * self.expansion, momentum=bn_momentum)
+
+        self.relu = ME.MinkowskiReLU(inplace=True)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.norm3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class ResNetBase(nn.Module):
+    BLOCK = None
+    LAYERS = ()
+    INIT_DIM = 64
+    PLANES = (64, 128, 256, 512)
+
+    def __init__(self, in_channels, out_channels, D=3):
+        nn.Module.__init__(self)
+        self.D = D
+        assert self.BLOCK is not None
+
+        self.network_initialization(in_channels, out_channels, D)
+        self.weight_initialization()
+
+    def network_initialization(self, in_channels, out_channels, D):
+        self.inplanes = self.INIT_DIM
+        self.conv1 = nn.Sequential(
+            ME.MinkowskiConvolution(in_channels, self.inplanes, kernel_size=3, stride=2, dimension=D),
+            ME.MinkowskiInstanceNorm(self.inplanes),
+            ME.MinkowskiReLU(inplace=True),
+            ME.MinkowskiMaxPooling(kernel_size=2, stride=2, dimension=D),
         )
 
-    def forward(self, coords, features):
-        """
-        coords: Tensor [N, 3] (XYZ coordinates for N points)
-        features: Tensor [N, 14] (intensity, returns, color features per point)
-        """
-        N = coords.size(0)
-        # 1. Set Abstraction Layer 1
-        # Sample a subset of points (e.g., 50% of points for SA1)
-        idx1 = safe_fps(coords, ratio=0.5)
-        coords1 = coords[idx1]  # coordinates of sampled points
-        # Find neighbors of each sampled point within a radius or k-NN
-        neighbor_idx1 = safe_knn(coords, coords1, k=32)
-        # knn returns index pairs (index_in_x, index_in_y) for each neighbor relationship
-        # Separate indices for clarity
-        src_idx = neighbor_idx1[0]  # indices of neighbors in original set
-        dst_idx = neighbor_idx1[1]  # indices of corresponding centroid (in coords1)
-        # Compute relative coordinates and get features for neighbors
-        neighbor_coords = coords[src_idx] - coords1[dst_idx]  # [total_neighbors, 3]
-        neighbor_feat = features[src_idx]  # [total_neighbors, 14]
-        # Combine neighbor relative coords and features
-        neighbor_input = torch.cat([neighbor_coords, neighbor_feat], dim=1)  # [?, 17]
-        # Apply PointNet (shared MLP + max pool) on neighbor features for each centroid
-        feat1 = self.sa1_mlp(neighbor_input)  # produces [?, 128] for all neighbor points
-        # We need to aggregate (max) for each group of neighbors belonging to the same centroid
-        # We can use scatter_max (from torch_scatter) or group by dst_idx:
-        num_centroids = coords1.size(0)
-        # Initialize tensor for aggregated features per centroid
-        feat1_max = torch.zeros((num_centroids, 128), device=feat1.device)
-        # Scatter max manually: group by dst_idx
-        feat1_max.index_add_(0, dst_idx, feat1)  # using index_add as a workaround for max
-        # (In practice, use torch_scatter.scatter to get max per group)
-        # After aggregation, feat1_max is [N1, 128]
+        self.layer1 = self._make_layer(self.BLOCK, self.PLANES[0], self.LAYERS[0], stride=2)
+        self.layer2 = self._make_layer(self.BLOCK, self.PLANES[1], self.LAYERS[1], stride=2)
+        self.layer3 = self._make_layer(self.BLOCK, self.PLANES[2], self.LAYERS[2], stride=2)
+        self.layer4 = self._make_layer(self.BLOCK, self.PLANES[3], self.LAYERS[3], stride=2)
 
-        # 2. Set Abstraction Layer 2 (on the output of SA1)
-        idx2 = safe_fps(coords1, ratio=0.5)
-        coords2 = coords1[idx2]
-        neighbor_idx2 = safe_knn(coords1, coords2, k=32)
-        src_idx2 = neighbor_idx2[0];
-        dst_idx2 = neighbor_idx2[1]
-        neighbor_coords2 = coords1[src_idx2] - coords2[dst_idx2]  # relative coords in SA1 frame
-        neighbor_feat2 = feat1_max[src_idx2]  # SA1 features of neighbors
-        neighbor_input2 = torch.cat([neighbor_coords2, neighbor_feat2], dim=1)  # [?, 131]
-        feat2 = self.sa2_mlp(neighbor_input2)  # [?, 256] for neighbor points
-        # Aggregate to get features for each coords2 centroid
-        feat2_max = torch.zeros((coords2.size(0), 256), device=feat2.device)
-        feat2_max.index_add_(0, dst_idx2, feat2)  # (using sum as placeholder for max)
-        # feat2_max shape: [N2, 256]
+        self.conv5 = nn.Sequential(
+            ME.MinkowskiDropout(),
+            ME.MinkowskiConvolution(self.inplanes, self.inplanes, kernel_size=3, stride=3, dimension=D),
+            ME.MinkowskiInstanceNorm(self.inplanes),
+            ME.MinkowskiGELU(),
+        )
 
-        # 3. Feature Propagation Layer 1 (from SA2 back to SA1)
-        # We have coords2 (N2 points) with feat2_max (256-dim), and coords1 (N1 points) with feat1_max (128-dim).
-        # Interpolate features from coords2 to coords1:
-        # For simplicity, use nearest neighbor interpolation:
-        # Find 3 nearest coords2 for each coords1
-        interp_idx = safe_knn(coords2, coords1, k=3)
-        src_i = interp_idx[0];
-        dst_i = interp_idx[1]
-        # Get neighbor features and distances
-        diff = coords2[src_i] - coords1[dst_i]
-        dist2 = (diff ** 2).sum(dim=1).add(1e-9)  # squared distances (avoid zero)
-        inv_w = 1.0 / dist2  # inverse distance weights
-        # Normalize weights per target point (sum to 1 for the 3 neighbors)
-        # (Sum weights for each dst_i group)
-        w_sum = torch.zeros(coords1.size(0), device=coords1.device)
-        w_sum.index_add_(0, dst_i, inv_w)
-        weights = inv_w / (w_sum[dst_i] + 1e-9)
-        # Weighted sum of neighbor features
-        interp_feat = torch.zeros((coords1.size(0), 256), device=feat2_max.device)
-        interp_feat.index_add_(0, dst_i, feat2_max[src_i] * weights.unsqueeze(1))
-        # Now interp_feat is the interpolated 256-dim feature for each of the N1 points.
-        # Concatenate with skip connection from SA1 (feat1_max)
-        fp1_input = torch.cat([interp_feat, feat1_max], dim=1)  # [N1, 256+128]
-        feat1_fp = self.fp1_mlp(fp1_input)  # [N1, 128] upsampled features for SA1 points
+        self.glob_pool = ME.MinkowskiGlobalMaxPooling()
 
-        # 4. Feature Propagation Layer 2 (from SA1 back to original points)
-        interp_idx2 = safe_knn(coords1, coords, k=3)
-        src_j = interp_idx2[0];
-        dst_j = interp_idx2[1]
-        diff2 = coords1[src_j] - coords[dst_j]
-        dist2b = (diff2 ** 2).sum(dim=1).add(1e-9)
-        inv_w2 = 1.0 / dist2b
-        w_sum2 = torch.zeros(N, device=coords.device)
-        w_sum2.index_add_(0, dst_j, inv_w2)
-        weights2 = inv_w2 / (w_sum2[dst_j] + 1e-9)
-        interp_feat2 = torch.zeros((N, 128), device=feat1_fp.device)
-        interp_feat2.index_add_(0, dst_j, feat1_fp[src_j] * weights2.unsqueeze(1))
-        # Concatenate with original point features (the 14-dim input features as skip)
-        fp2_input = torch.cat([interp_feat2, features], dim=1)  # [N, 128+14]
-        feat0_fp = self.fp2_mlp(fp2_input)  # [N, 128]
+        self.final = ME.MinkowskiLinear(self.inplanes, out_channels, bias=True)
 
-        # 5. Per-point classification
-        scores = self.classifier(feat0_fp)  # [N, num_classes]
-        return scores
+    def weight_initialization(self):
+        for m in self.modules():
+            if isinstance(m, ME.MinkowskiConvolution):
+                ME.utils.kaiming_normal_(m.kernel, mode="fan_out", nonlinearity="relu")
+
+            if isinstance(m, ME.MinkowskiBatchNorm):
+                nn.init.constant_(m.bn.weight, 1)
+                nn.init.constant_(m.bn.bias, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilation=1, bn_momentum=0.1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                ME.MinkowskiConvolution(
+                    self.inplanes,
+                    planes * block.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    dimension=self.D,
+                ),
+                ME.MinkowskiBatchNorm(planes * block.expansion, momentum=bn_momentum),
+            )
+        layers = []
+        layers.append(
+            block(
+                self.inplanes,
+                planes,
+                stride=stride,
+                dilation=dilation,
+                downsample=downsample,
+                dimension=self.D,
+            )
+        )
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes, stride=1, dilation=dilation, dimension=self.D))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x: ME.SparseTensor):
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.conv5(x)
+        x = self.glob_pool(x)
+        return self.final(x)
+
+
+class MinkUNetBase(ResNetBase):
+    BLOCK = None
+    PLANES = None
+    DILATIONS = (1, 1, 1, 1, 1, 1, 1, 1)
+    LAYERS = (2, 2, 2, 2, 2, 2, 2, 2)
+    PLANES = (32, 64, 128, 256, 256, 256, 256, 256)
+    INIT_DIM = 32
+    OUT_TENSOR_STRIDE = 1
+
+    def __init__(self, in_channels, out_channels, D=3):
+        ResNetBase.__init__(self, in_channels, out_channels, D)
+
+    def network_initialization(self, in_channels, out_channels, D):
+        # Output of the first conv concated to conv6
+        self.inplanes = self.INIT_DIM
+        self.conv0p1s1 = ME.MinkowskiConvolution(in_channels, self.inplanes, kernel_size=5, dimension=D)
+
+        bn_momentum = 0.02
+        self.bn0 = ME.MinkowskiBatchNorm(self.inplanes, momentum=bn_momentum)
+
+        self.conv1p1s2 = ME.MinkowskiConvolution(self.inplanes, self.inplanes, kernel_size=2, stride=2, dimension=D)
+        self.bn1 = ME.MinkowskiBatchNorm(self.inplanes, momentum=bn_momentum)
+
+        self.block1 = self._make_layer(self.BLOCK, self.PLANES[0], self.LAYERS[0], bn_momentum=bn_momentum)
+
+        self.conv2p2s2 = ME.MinkowskiConvolution(self.inplanes, self.inplanes, kernel_size=2, stride=2, dimension=D)
+        self.bn2 = ME.MinkowskiBatchNorm(self.inplanes, momentum=bn_momentum)
+
+        self.block2 = self._make_layer(self.BLOCK, self.PLANES[1], self.LAYERS[1], bn_momentum=bn_momentum)
+
+        self.conv3p4s2 = ME.MinkowskiConvolution(self.inplanes, self.inplanes, kernel_size=2, stride=2, dimension=D)
+
+        self.bn3 = ME.MinkowskiBatchNorm(self.inplanes, momentum=bn_momentum)
+        self.block3 = self._make_layer(self.BLOCK, self.PLANES[2], self.LAYERS[2], bn_momentum=bn_momentum)
+
+        self.conv4p8s2 = ME.MinkowskiConvolution(self.inplanes, self.inplanes, kernel_size=2, stride=2, dimension=D)
+        self.bn4 = ME.MinkowskiBatchNorm(self.inplanes, momentum=bn_momentum)
+        self.block4 = self._make_layer(self.BLOCK, self.PLANES[3], self.LAYERS[3], bn_momentum=bn_momentum)
+
+        self.convtr4p16s2 = ME.MinkowskiConvolutionTranspose(
+            self.inplanes, self.PLANES[4], kernel_size=2, stride=2, dimension=D
+        )
+        self.bntr4 = ME.MinkowskiBatchNorm(self.PLANES[4], momentum=bn_momentum)
+
+        self.inplanes = self.PLANES[4] + self.PLANES[2] * self.BLOCK.expansion
+        self.block5 = self._make_layer(self.BLOCK, self.PLANES[4], self.LAYERS[4], bn_momentum=bn_momentum)
+        self.convtr5p8s2 = ME.MinkowskiConvolutionTranspose(
+            self.inplanes, self.PLANES[5], kernel_size=2, stride=2, dimension=D
+        )
+        self.bntr5 = ME.MinkowskiBatchNorm(self.PLANES[5], momentum=bn_momentum)
+
+        self.inplanes = self.PLANES[5] + self.PLANES[1] * self.BLOCK.expansion
+        self.block6 = self._make_layer(self.BLOCK, self.PLANES[5], self.LAYERS[5], bn_momentum=bn_momentum)
+        self.convtr6p4s2 = ME.MinkowskiConvolutionTranspose(
+            self.inplanes, self.PLANES[6], kernel_size=2, stride=2, dimension=D
+        )
+        self.bntr6 = ME.MinkowskiBatchNorm(self.PLANES[6], momentum=bn_momentum)
+
+        self.inplanes = self.PLANES[6] + self.PLANES[0] * self.BLOCK.expansion
+        self.block7 = self._make_layer(self.BLOCK, self.PLANES[6], self.LAYERS[6], bn_momentum=bn_momentum)
+        self.convtr7p2s2 = ME.MinkowskiConvolutionTranspose(
+            self.inplanes, self.PLANES[7], kernel_size=2, stride=2, dimension=D
+        )
+        self.bntr7 = ME.MinkowskiBatchNorm(self.PLANES[7], momentum=bn_momentum)
+
+        self.inplanes = self.PLANES[7] + self.INIT_DIM
+        self.block8 = self._make_layer(self.BLOCK, self.PLANES[7], self.LAYERS[7], bn_momentum=bn_momentum)
+
+        self.final = ME.MinkowskiConvolution(
+            self.PLANES[7] * self.BLOCK.expansion, out_channels, kernel_size=1, bias=True, dimension=D
+        )
+        self.relu = ME.MinkowskiReLU(inplace=True)
+
+    def forward(self, x):
+        out = self.conv0p1s1(x)
+        out = self.bn0(out)
+        out_p1 = self.relu(out)
+
+        out = self.conv1p1s2(out_p1)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out_b1p2 = self.block1(out)
+
+        out = self.conv2p2s2(out_b1p2)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out_b2p4 = self.block2(out)
+
+        out = self.conv3p4s2(out_b2p4)
+        out = self.bn3(out)
+        out = self.relu(out)
+        out_b3p8 = self.block3(out)
+
+        # tensor_stride=16
+        out = self.conv4p8s2(out_b3p8)
+        out = self.bn4(out)
+        out = self.relu(out)
+        out = self.block4(out)
+
+        # tensor_stride=8
+        out = self.convtr4p16s2(out)
+        out = self.bntr4(out)
+        out = self.relu(out)
+
+        out = ME.cat(out, out_b3p8)
+        out = self.block5(out)
+
+        # tensor_stride=4
+        out = self.convtr5p8s2(out)
+        out = self.bntr5(out)
+        out = self.relu(out)
+
+        out = ME.cat(out, out_b2p4)
+        out = self.block6(out)
+
+        # tensor_stride=2
+        out = self.convtr6p4s2(out)
+        out = self.bntr6(out)
+        out = self.relu(out)
+
+        out = ME.cat(out, out_b1p2)
+        out = self.block7(out)
+
+        # tensor_stride=1
+        out = self.convtr7p2s2(out)
+        out = self.bntr7(out)
+        out = self.relu(out)
+
+        out = ME.cat(out, out_p1)
+        out = self.block8(out)
+
+        return self.final(out)
+
+
+class MinkUNet14(MinkUNetBase):
+    BLOCK = BasicBlock
+    LAYERS = (1, 1, 1, 1, 1, 1, 1, 1)
+
+
+class MinkUNet14C(MinkUNet14):
+    PLANES = (32, 64, 128, 256, 192, 192, 128, 128)
