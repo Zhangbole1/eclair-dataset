@@ -1,0 +1,10 @@
+torch>=1.13
+torchvision
+torchmetrics
+torch-geometric  # 包含 fps, knn
+torch-scatter    # 用于 scatter_max
+numpy
+laspy
+pyyaml           # 读取 test.yaml
+tqdm
+pyyaml

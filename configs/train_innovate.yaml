@@ -1,0 +1,48 @@
+dataset:
+  train_data_path: /data/train
+  val_data_path: /data/val
+  num_classes: 12                 # 类别总数（包括背景/未分类类，如有）
+  voxel_size: 0.05                # 体素大小，用于点云体素化
+  batch_size: 4
+  num_workers: 4
+
+model:
+  name: "MinkUNet14C"             # 模型名称（在model.py中定义的类，或MinkowskiEngine提供的网络）
+  in_channels: 5                 # 模型输入特征通道数，例如: XYZ之外的特征数 (法向量3 + 高度1 + 原始强度1 = 5)
+  # out_channels 可由 dataset.num_classes 指定，这里无需重复
+  # args: {}  # 如果模型构造需要其他参数，可通过此处传入
+
+loss:
+  name: "combined"               # 使用组合损失 (Focal + Dice)
+  focal_alpha: 0.25              # FocalLoss的alpha参数(类别权重因子)，支持list为各类别权重或float二分类权重
+  focal_gamma: 2.0               # FocalLoss的gamma参数
+  focal_weight: 1.0              # FocalLoss在组合损失中的权重系数
+  dice_weight: 1.0               # DiceLoss在组合损失中的权重系数
+  ohem_thresh: 0.7               # OHEM筛选阈值：仅训练预测概率低于0.7的样本
+  ohem_min_kept: 10000           # OHEM至少保留的样本数量。如果总难样本低于此数，则按损失值补足
+  ignore_index: -100             # 忽略的类别标签(如果有未标注点)
+
+optimizer:
+  type: "Adam"                   # 使用Adam优化器
+  lr: 0.001                      # 初始学习率
+  weight_decay: 1e-4             # 权重衰减(L2正则)
+  # 对于SGD可以指定 momentum等，这里使用Adam所以略过beta设置
+
+scheduler:
+  type: "StepLR"                 # 使用StepLR学习率调度
+  step_size: 10                  # 每10个epoch学习率衰减
+  gamma: 0.5                     # 衰减因子：学习率乘以0.5
+
+transforms:
+  random_rotate: true            # 是否随机旋转点云
+  rotate_axis: "z"               # 旋转轴 ('x','y','z')
+  rotate_angle: 360              # 最大旋转角度范围（度数）
+  compute_normals: true          # 是否计算法向量特征
+  normals_knn: 16                # 计算法向量时使用的近邻数量
+  height_above_ground: true      # 是否添加相对地面高度特征
+
+train:
+  epochs: 50                     # 训练epoch数
+  device: "cuda"                 # 设备 ('cuda' 或 'cpu')
+  output_dir: "checkpoints"      # 保存模型和日志的目录
+  save_model_name: "model_innovative.pth"  # 最终保存模型文件名

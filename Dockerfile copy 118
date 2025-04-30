@@ -14,7 +14,7 @@ ENV TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6+PTX" \
 
 # 系统依赖 + Micromamba
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bzip2 build-essential cmake git curl wget \
+      bzip2 build-essential curl git wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=micromamba $MAMBA_EXE $MAMBA_EXE
@@ -30,23 +30,33 @@ RUN micromamba install -y -n base -c conda-forge \
 # 升级 pip
 RUN micromamba run -n base pip install --upgrade pip
 
-# 安装 PyTorch + TorchVision + TorchAudio (在 runtime 阶段也会重装覆盖)
-RUN micromamba install -y -n base -c pytorch -c conda-forge \
-      pytorch=2.0.1 cudatoolkit=11.8 \
-      torchvision=0.15.2 torchaudio=2.0.2 \
-    && micromamba clean --all --yes
+# 安装 PyTorch cu118 wheel
+RUN wget --tries=5 --timeout=30 --continue \
+      -P /tmp \
+      https://download.pytorch.org/whl/cu118/torch-2.0.1%2Bcu118-cp310-cp310-linux_x86_64.whl \
+  && micromamba run -n base pip install --no-cache-dir \
+      /tmp/torch-2.0.1+cu118-cp310-cp310-linux_x86_64.whl \
+  && rm /tmp/torch-2.0.1+cu118-cp310-cp310-linux_x86_64.whl
 
-# 构建 MinkowskiEngine Wheel
-RUN git clone -q https://github.com/NVIDIA/MinkowskiEngine.git \
+# torchvision/torchaudio
+RUN micromamba run -n base pip install --no-cache-dir \
+      torchvision==0.15.2 \
+      torchaudio==2.0.2 \
+      --no-deps \
+  && micromamba clean --all --yes
+
+# 编译 MinkowskiEngine（如需）
+RUN git clone -q https://github.com/NVIDIA/MinkowskiEngine \
  && MAX_JOBS=4 micromamba run -n base python -m pip wheel \
       --disable-pip-version-check --no-deps --no-cache-dir \
       --build-option="--force_cuda" \
       --build-option="--blas_include_dirs=${MAMBA_ROOT_PREFIX}/include" \
       --build-option="--blas=mkl" \
-      MinkowskiEngine
+      ./MinkowskiEngine
 
 # ---------- Stage: runtime ----------
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04 AS runtime
+
 ENV MAMBA_ROOT_PREFIX=/opt/conda \
     MAMBA_EXE=/bin/micromamba \
     PATH=/opt/conda/bin:$PATH \
@@ -57,28 +67,17 @@ COPY --from=micromamba /usr/local/bin/_*.sh /usr/local/bin/
 RUN /usr/local/bin/_dockerfile_setup_root_prefix.sh
 SHELL ["/usr/local/bin/_dockerfile_shell.sh"]
 
-# 复制完整 conda 环境
+# 拷贝完整 conda 环境
 COPY --from=build /opt/conda /opt/conda
-
-# 重新安装 GPU 版 PyTorch（覆盖 CPU-only）
-RUN micromamba install -y -n base -c pytorch -c conda-forge \
-      pytorch=2.0.1 cudatoolkit=11.8 \
-      torchvision=0.15.2 torchaudio=2.0.2 \
-    && micromamba clean --all --yes
-
-# 安装 MinkowskiEngine Wheel
-COPY --from=build /build/*.whl /wheels/
-RUN micromamba run -n base pip install --no-cache-dir /wheels/*.whl \
- && rm -rf /wheels
 
 # 安装其它依赖并清理
 ADD environment.yml /tmp/environment.yml
-COPY --from=build /build/*.whl /wheels/  # 如果有其他本地 whl
+COPY --from=build /build/*.whl /wheels/
 RUN micromamba install -y -n base -f /tmp/environment.yml \
  && micromamba run -n base pip install --no-cache-dir /wheels/*.whl \
  && micromamba clean --all --yes \
  && rm -rf /wheels /tmp/environment.yml
 
 WORKDIR /app
-COPY *.py ./
+COPY *.py ./  
 COPY configs ./configs
